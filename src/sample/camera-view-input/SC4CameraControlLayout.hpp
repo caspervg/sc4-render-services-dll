@@ -193,6 +193,25 @@ namespace SC4CameraControl
         return DegToRad(SanitizeAngleDegrees(clampedDegrees));
     }
 
+    inline int32_t WrapRotation(int32_t rotation)
+    {
+        rotation %= 4;
+        if (rotation < 0) {
+            rotation += 4;
+        }
+        return rotation;
+    }
+
+    inline void RebalanceYawAndRotation(float& yaw, int32_t& rotation)
+    {
+        constexpr float kQuarterTurn = kPi * 0.5f;
+        constexpr float kNativeYawAnchor = -kPi * 0.125f;
+
+        const auto quarterTurns = static_cast<int32_t>(std::lround((yaw - kNativeYawAnchor) / kQuarterTurn));
+        yaw = SanitizeYawRadians(yaw - (static_cast<float>(quarterTurns) * kQuarterTurn));
+        rotation = WrapRotation(rotation + quarterTurns);
+    }
+
     inline void SanitizeAngles(SC4CameraControlLayout& cameraControl)
     {
         cameraControl.yaw = SanitizeYawRadians(cameraControl.yaw);
@@ -318,19 +337,61 @@ namespace SC4CameraControl
     inline bool SetCustomMagnification(const float value)
     {
         auto* cameraControl = GetActiveCameraControl();
-        auto thunk = GetSetCustomMagnification();
-        return cameraControl && thunk && thunk(cameraControl, std::clamp(value, 0.001f, 10.0f));
-    }
-
-    inline bool SetYawPitch(const float yaw, const float pitch)
-    {
-        auto* cameraControl = GetActiveCameraControl();
         if (!cameraControl) {
             return false;
         }
 
-        const float sanitizedYaw = SanitizeYawRadians(yaw);
+        float magnification = std::clamp(value, 0.001f, 10.0f);
+        int32_t zoom = cameraControl->zoom;
+        const int32_t minZoom = static_cast<int32_t>(std::floor(cameraControl->minZoom));
+        const int32_t maxZoom = static_cast<int32_t>(std::floor(cameraControl->maxZoomLevelWithoutCustom));
+
+        while (magnification > 2.0f && zoom < maxZoom) {
+            magnification *= 0.5f;
+            ++zoom;
+        }
+
+        while (magnification < 0.5f && zoom > minZoom) {
+            magnification *= 2.0f;
+            --zoom;
+        }
+
+        if (zoom != cameraControl->zoom) {
+            auto* renderer = GetActiveRenderer();
+            if (!renderer || !renderer->SetZoom(zoom)) {
+                return false;
+            }
+        }
+
+        cameraControl = GetActiveCameraControl();
+        auto thunk = GetSetCustomMagnification();
+        return cameraControl && thunk && thunk(cameraControl, std::clamp(magnification, 0.001f, 10.0f));
+    }
+
+    inline bool SetYawPitch(const float yaw, const float pitch)
+    {
+        auto* renderer = GetActiveRenderer();
+        auto* cameraControl = GetActiveCameraControl();
+        if (!renderer || !cameraControl) {
+            return false;
+        }
+
+        float sanitizedYaw = SanitizeYawRadians(yaw);
         const float sanitizedPitch = SanitizePitchRadians(pitch);
+        int32_t targetRotation = cameraControl->rotation;
+
+        RebalanceYawAndRotation(sanitizedYaw, targetRotation);
+
+        if (targetRotation != cameraControl->rotation) {
+            if (!renderer->SetRotation(targetRotation)) {
+                return false;
+            }
+
+            cameraControl = GetActiveCameraControl();
+            if (!cameraControl) {
+                return false;
+            }
+        }
 
         ApplyYawOverride(sanitizedYaw);
         ApplyPitchOverride(sanitizedPitch);
