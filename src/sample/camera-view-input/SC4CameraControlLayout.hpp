@@ -176,7 +176,15 @@ namespace SC4CameraControl
 
     inline float SanitizeYawRadians(const float yaw)
     {
-        return DegToRad(SanitizeAngleDegrees(RadToDeg(yaw)));
+        float normalizedYaw = std::fmod(yaw, 2.0f * kPi);
+        if (normalizedYaw <= -kPi) {
+            normalizedYaw += 2.0f * kPi;
+        }
+        else if (normalizedYaw > kPi) {
+            normalizedYaw -= 2.0f * kPi;
+        }
+
+        return normalizedYaw;
     }
 
     inline float SanitizePitchRadians(const float pitch)
