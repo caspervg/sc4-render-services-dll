@@ -5,6 +5,7 @@
 #include <imgui.h>
 #include <mutex>
 #include <new>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -77,7 +78,15 @@ private:
     struct ManagedFont
     {
         uint32_t id;
-        ImFont* font;  // Pointer to ImFont* managed by ImGui
+        ImFont* font;  // Pointer to ImFont* managed by ImGui; nullptr while registration is pending.
+    };
+
+    struct PendingFontRegistration
+    {
+        uint32_t id;
+        float sizePixels;
+        std::string filePath;
+        std::vector<uint8_t> compressedData;
     };
 
     struct ManagedTexture
@@ -122,12 +131,14 @@ private:
     void RenderFrame_(IDirect3DDevice7* device);
     bool EnsureInitialized_();
     void InitializePanels_();
+    void ProcessPendingFontRegistrations_();
     void SortPanels_();
     bool InstallWndProcHook_(HWND hwnd);
     void RemoveWndProcHook_();
     static LRESULT CALLBACK WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
     // Texture management helpers
+    bool RebuildFontAtlas_();
     bool CreateSurfaceForTexture_(ManagedTexture& tex);
     void OnDeviceLost_();
     void OnDeviceRestored_();
@@ -141,6 +152,8 @@ private:
     mutable std::mutex renderQueueMutex_;
 
     std::unordered_map<uint32_t, ManagedFont> fonts_;  // Key: font ID
+    std::vector<PendingFontRegistration> pendingFontRegistrations_;
+    bool fontAtlasRebuildPending_{false};
     mutable std::mutex fontsMutex_;
 
     std::unordered_map<uint32_t, ManagedTexture> textures_;  // Key: texture ID

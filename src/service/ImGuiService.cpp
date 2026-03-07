@@ -24,6 +24,27 @@ namespace {
     std::atomic<ImGuiService*> g_instance{nullptr};
     std::atomic<DWORD> g_renderThreadId{0};
 
+    bool IsRenderThreadCallAllowed_(const char* operation, const bool allowBeforeRenderThreadKnown) {
+        const DWORD threadId = GetCurrentThreadId();
+        const DWORD renderThreadId = g_renderThreadId.load(std::memory_order_acquire);
+
+        if (renderThreadId == 0) {
+            if (allowBeforeRenderThreadKnown) {
+                return true;
+            }
+
+            LOG_WARN("{}: render thread is not established yet", operation);
+            return false;
+        }
+
+        if (renderThreadId != threadId) {
+            LOG_ERROR("{}: called off render thread (tid={}, render_tid={})", operation, threadId, renderThreadId);
+            return false;
+        }
+
+        return true;
+    }
+
     struct Dx7ImGuiStateRestore {
         IDirect3DDevice7* device;
         bool hasStage0Coord;
@@ -186,6 +207,13 @@ bool ImGuiService::Shutdown() {
             }
         }
         renderQueue_.clear();
+    }
+
+    {
+        std::lock_guard fontLock(fontsMutex_);
+        fonts_.clear();
+        pendingFontRegistrations_.clear();
+        fontAtlasRebuildPending_ = false;
     }
 
     // Clean up all textures before shutting down ImGui
@@ -394,7 +422,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
     {
         std::lock_guard lock(panelsMutex_);
-        if (!initialized_ || panels_.empty()) {
+        if (!initialized_) {
             return;
         }
     }
@@ -423,6 +451,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
     }
 
     InitializePanels_();
+    ProcessPendingFontRegistrations_();
 
     ImGui_ImplWin32_NewFrame();
     ImGui_ImplDX7_NewFrame();
@@ -671,15 +700,12 @@ LRESULT CALLBACK ImGuiService::WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, L
 // Texture management implementation
 
 ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
-    const DWORD threadId = GetCurrentThreadId();
     const DWORD renderThreadId = g_renderThreadId.load(std::memory_order_acquire);
-    if (renderThreadId != 0 && renderThreadId != threadId) {
-        LOG_WARN("ImGuiService::CreateTexture: called off render thread (tid={}, render_tid={})",
-                 threadId, renderThreadId);
+    const bool renderThreadKnown = renderThreadId != 0;
+    if (!IsRenderThreadCallAllowed_("ImGuiService::CreateTexture", true) && renderThreadKnown) {
+        return ImGuiTextureHandle{0, 0};
     }
-    else {
-        LOG_DEBUG("ImGuiService::CreateTexture: thread id {}", threadId);
-    }
+
     // Validate parameters
     if (desc.width == 0 || desc.height == 0 || !desc.pixels) {
         LOG_ERROR("ImGuiService::CreateTexture: invalid parameters (width={}, height={}, pixels={})",
@@ -711,11 +737,6 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
 
     // Create managed texture entry
     ManagedTexture tex;
-    tex.id = nextTextureId_++;
-    if (tex.id == 0) {
-        LOG_ERROR("ImGuiService::CreateTexture: texture ID space exhausted");
-        return ImGuiTextureHandle{0, 0};
-    }
     tex.width = desc.width;
     tex.height = desc.height;
     tex.creationGeneration = currentGen;
@@ -728,8 +749,22 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
     tex.sourceData.resize(dataSize);
     std::memcpy(tex.sourceData.data(), desc.pixels, dataSize);
 
-    // Attempt initial surface creation
-    if (IsDeviceReady() && !deviceLost_) {
+    {
+        std::lock_guard lock(texturesMutex_);
+        tex.id = nextTextureId_++;
+        if (tex.id == 0) {
+            LOG_ERROR("ImGuiService::CreateTexture: texture ID space exhausted");
+            return ImGuiTextureHandle{0, 0};
+        }
+    }
+
+    // Only the render thread may talk to D3D. Before the render thread is known,
+    // create a deferred entry and let GetTextureID() realize it later.
+    if (!renderThreadKnown) {
+        tex.needsRecreation = true;
+        LOG_WARN("ImGuiService::CreateTexture: render thread not established yet, deferring surface creation (id={})", tex.id);
+    }
+    else if (IsDeviceReady() && !deviceLost_) {
         if (!CreateSurfaceForTexture_(tex)) {
             LOG_WARN("ImGuiService::CreateTexture: surface creation failed, will retry later (id={})", tex.id);
             tex.needsRecreation = true;
@@ -753,6 +788,10 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
 }
 
 void* ImGuiService::GetTextureID(const ImGuiTextureHandle handle) {
+    if (!IsRenderThreadCallAllowed_("ImGuiService::GetTextureID", false)) {
+        return nullptr;
+    }
+
     // Check device generation first - return nullptr if mismatch
     uint32_t currentGen = deviceGeneration_.load(std::memory_order_acquire);
     if (handle.generation != currentGen) {
@@ -801,6 +840,10 @@ void* ImGuiService::GetTextureID(const ImGuiTextureHandle handle) {
 }
 
 void ImGuiService::ReleaseTexture(ImGuiTextureHandle handle) {
+    if (!IsRenderThreadCallAllowed_("ImGuiService::ReleaseTexture", false)) {
+        return;
+    }
+
     std::lock_guard lock(texturesMutex_);
 
     auto it = textures_.find(handle.id);
@@ -816,6 +859,10 @@ void ImGuiService::ReleaseTexture(ImGuiTextureHandle handle) {
 }
 
 bool ImGuiService::IsTextureValid(const ImGuiTextureHandle handle) const {
+    if (!IsRenderThreadCallAllowed_("ImGuiService::IsTextureValid", false)) {
+        return false;
+    }
+
     uint32_t currentGen = deviceGeneration_.load(std::memory_order_acquire);
     if (handle.generation != currentGen) {
         return false;
@@ -840,8 +887,7 @@ bool ImGuiService::RegisterFont(uint32_t fontId, const char* filePath, float siz
         return false;
     }
 
-    ImGuiIO& io = ImGui::GetIO();
-    if (!io.Fonts) {
+    if (!ImGui::GetCurrentContext()) {
         LOG_ERROR("ImGuiService::RegisterFont: ImGui not initialized");
         return false;
     }
@@ -854,35 +900,27 @@ bool ImGuiService::RegisterFont(uint32_t fontId, const char* filePath, float siz
         return false;
     }
 
-    // Configure font with improved rendering
-    ImFontConfig fontConfig;
-    fontConfig.OversampleH = 2;
-    fontConfig.OversampleV = 2;
-    fontConfig.PixelSnapH = true;
-    fontConfig.GlyphExtraAdvanceX = 1.0f;
+    pendingFontRegistrations_.push_back(PendingFontRegistration{
+        .id = fontId,
+        .sizePixels = sizePixels,
+        .filePath = filePath,
+        .compressedData = {}});
+    fonts_[fontId] = {fontId, nullptr};
+    fontAtlasRebuildPending_ = true;
 
-    // Load the font
-    ImFont* font = io.Fonts->AddFontFromFileTTF(filePath, sizePixels, &fontConfig);
-    if (!font) {
-        LOG_ERROR("ImGuiService::RegisterFont: failed to load font from '{}'", filePath);
-        return false;
-    }
-
-    fonts_[fontId] = {fontId, font};
-    LOG_INFO("ImGuiService::RegisterFont: registered font ID {} from '{}' (size={})", fontId, filePath, sizePixels);
+    LOG_INFO("ImGuiService::RegisterFont: queued font ID {} from '{}' (size={})", fontId, filePath, sizePixels);
     return true;
 }
 
 bool ImGuiService::RegisterFont(uint32_t fontId, const void* compressedFontData, const int compressedFontDataSize,
                                 float sizePixels) {
-    if (!compressedFontData || compressedFontDataSize < 0 || sizePixels <= 0.0f) {
+    if (!compressedFontData || compressedFontDataSize <= 0 || sizePixels <= 0.0f) {
         LOG_ERROR("ImGuiService::RegisterFont: invalid arguments (fontId={}, compressedFontDataSize={}, size={})",
                   fontId, compressedFontDataSize, sizePixels);
         return false;
     }
 
-    ImGuiIO& io = ImGui::GetIO();
-    if (!io.Fonts) {
+    if (!ImGui::GetCurrentContext()) {
         LOG_ERROR("ImGuiService::RegisterFont: ImGui not initialized");
         return false;
     }
@@ -895,22 +933,18 @@ bool ImGuiService::RegisterFont(uint32_t fontId, const void* compressedFontData,
         return false;
     }
 
-    // Configure font with improved rendering
-    ImFontConfig fontConfig;
-    fontConfig.OversampleH = 2;
-    fontConfig.OversampleV = 2;
-    fontConfig.PixelSnapH = true;
-    fontConfig.GlyphExtraAdvanceX = 1.0f;
+    PendingFontRegistration pendingRegistration{
+        .id = fontId,
+        .sizePixels = sizePixels,
+        .filePath = {},
+        .compressedData = std::vector<uint8_t>(compressedFontDataSize)};
+    std::memcpy(pendingRegistration.compressedData.data(), compressedFontData, static_cast<size_t>(compressedFontDataSize));
 
-    // Load the font
-    ImFont* font = io.Fonts->AddFontFromMemoryCompressedTTF(compressedFontData, compressedFontDataSize, sizePixels, &fontConfig);
-    if (!font) {
-        LOG_ERROR("ImGuiService::RegisterFont: failed to load font from compressed data (fontDataSize={})", compressedFontDataSize);
-        return false;
-    }
+    pendingFontRegistrations_.push_back(std::move(pendingRegistration));
+    fonts_[fontId] = {fontId, nullptr};
+    fontAtlasRebuildPending_ = true;
 
-    fonts_[fontId] = {fontId, font};
-    LOG_INFO("ImGuiService::RegisterFont: registered font ID {} from compressed data (size={})", fontId, sizePixels);
+    LOG_INFO("ImGuiService::RegisterFont: queued font ID {} from compressed data (size={})", fontId, sizePixels);
     return true;
 }
 
@@ -924,11 +958,23 @@ bool ImGuiService::UnregisterFont(uint32_t fontId) {
     }
 
     fonts_.erase(fontId);
+    pendingFontRegistrations_.erase(
+        std::remove_if(
+            pendingFontRegistrations_.begin(),
+            pendingFontRegistrations_.end(),
+            [fontId](const PendingFontRegistration& pending) {
+                return pending.id == fontId;
+            }),
+        pendingFontRegistrations_.end());
     LOG_INFO("ImGuiService::UnregisterFont: unregistered font ID {}", fontId);
     return true;
 }
 
 void* ImGuiService::GetFont(const uint32_t fontId) const {
+    if (!ImGui::GetCurrentContext()) {
+        return nullptr;
+    }
+
     if (fontId == 0) {
         // Return default font
         return ImGui::GetIO().FontDefault;
@@ -941,6 +987,117 @@ void* ImGuiService::GetFont(const uint32_t fontId) const {
     }
 
     return it->second.font;
+}
+
+void ImGuiService::ProcessPendingFontRegistrations_() {
+    if (!imguiInitialized_ || !ImGui::GetCurrentContext()) {
+        return;
+    }
+
+    std::vector<PendingFontRegistration> pendingRegistrations;
+    bool rebuildRequested = false;
+    {
+        std::lock_guard lock(fontsMutex_);
+        pendingRegistrations.swap(pendingFontRegistrations_);
+        rebuildRequested = fontAtlasRebuildPending_;
+        fontAtlasRebuildPending_ = false;
+    }
+
+    if (pendingRegistrations.empty() && !rebuildRequested) {
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (!io.Fonts) {
+        std::lock_guard lock(fontsMutex_);
+        fontAtlasRebuildPending_ = true;
+        pendingFontRegistrations_.insert(
+            pendingFontRegistrations_.begin(),
+            std::make_move_iterator(pendingRegistrations.begin()),
+            std::make_move_iterator(pendingRegistrations.end()));
+        return;
+    }
+
+    std::vector<std::pair<uint32_t, ImFont*>> appliedFonts;
+    std::vector<uint32_t> failedFontIds;
+    appliedFonts.reserve(pendingRegistrations.size());
+    failedFontIds.reserve(pendingRegistrations.size());
+
+    for (const PendingFontRegistration& pending : pendingRegistrations) {
+        ImFontConfig fontConfig;
+        fontConfig.OversampleH = 2;
+        fontConfig.OversampleV = 2;
+        fontConfig.PixelSnapH = true;
+        fontConfig.GlyphExtraAdvanceX = 1.0f;
+
+        ImFont* font = nullptr;
+        if (!pending.filePath.empty()) {
+            font = io.Fonts->AddFontFromFileTTF(pending.filePath.c_str(), pending.sizePixels, &fontConfig);
+            if (!font) {
+                LOG_ERROR("ImGuiService::RegisterFont: failed to load font from '{}'", pending.filePath);
+            }
+        } else {
+            font = io.Fonts->AddFontFromMemoryCompressedTTF(
+                pending.compressedData.data(),
+                static_cast<int>(pending.compressedData.size()),
+                pending.sizePixels,
+                &fontConfig);
+            if (!font) {
+                LOG_ERROR(
+                    "ImGuiService::RegisterFont: failed to load font from compressed data (fontDataSize={})",
+                    pending.compressedData.size());
+            }
+        }
+
+        if (!font) {
+            failedFontIds.push_back(pending.id);
+            continue;
+        }
+
+        appliedFonts.emplace_back(pending.id, font);
+        rebuildRequested = true;
+    }
+
+    {
+        std::lock_guard lock(fontsMutex_);
+        for (const auto& [id, font] : appliedFonts) {
+            auto it = fonts_.find(id);
+            if (it != fonts_.end()) {
+                it->second.font = font;
+            }
+        }
+        for (const uint32_t id : failedFontIds) {
+            auto it = fonts_.find(id);
+            if (it != fonts_.end() && it->second.font == nullptr) {
+                fonts_.erase(it);
+            }
+        }
+    }
+
+    if (rebuildRequested && !RebuildFontAtlas_()) {
+        std::lock_guard lock(fontsMutex_);
+        fontAtlasRebuildPending_ = true;
+        LOG_ERROR("ImGuiService::ProcessPendingFontRegistrations_: failed to rebuild font atlas texture");
+        return;
+    }
+
+    for (const auto& [id, _] : appliedFonts) {
+        LOG_INFO("ImGuiService::RegisterFont: registered font ID {}", id);
+    }
+}
+
+bool ImGuiService::RebuildFontAtlas_() {
+    if (!imguiInitialized_ || !ImGui::GetCurrentContext()) {
+        return false;
+    }
+
+    ImGui_ImplDX7_InvalidateDeviceObjects();
+    if (!ImGui_ImplDX7_CreateDeviceObjects()) {
+        return false;
+    }
+
+    LOG_INFO("ImGuiService::RebuildFontAtlas_: rebuilt font atlas texture");
+    return true;
 }
 
 bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
