@@ -377,3 +377,4 @@ extra-info/
 fonts/
 docs/doxygen/
 dist/*.exe
+imgui.lib
