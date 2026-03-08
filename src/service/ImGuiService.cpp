@@ -24,6 +24,18 @@ namespace {
     std::atomic<ImGuiService*> g_instance{nullptr};
     std::atomic<DWORD> g_renderThreadId{0};
 
+    bool IsDeviceLostResult_(const HRESULT hr) {
+        switch (hr) {
+        case DDERR_SURFACELOST:
+        case DDERR_WRONGMODE:
+        case DDERR_NOEXCLUSIVEMODE:
+        case DDERR_EXCLUSIVEMODEALREADYSET:
+            return true;
+        default:
+            return FAILED(hr);
+        }
+    }
+
     bool IsRenderThreadCallAllowed_(const char* operation, const bool allowBeforeRenderThreadKnown) {
         const DWORD threadId = GetCurrentThreadId();
         const DWORD renderThreadId = g_renderThreadId.load(std::memory_order_acquire);
@@ -118,6 +130,8 @@ ImGuiService::ImGuiService()
     : cRZBaseSystemService(kImGuiServiceID, 0)
       , gameWindow_(nullptr)
       , originalWndProc_(nullptr)
+      , lastKnownDevice_(nullptr)
+      , lastKnownDDraw_(nullptr)
       , initialized_(false)
       , imguiInitialized_(false)
       , hookInstalled_(false)
@@ -235,6 +249,10 @@ bool ImGuiService::Shutdown() {
 
     imguiInitialized_ = false;
     hookInstalled_ = false;
+    deviceLost_ = false;
+    lastKnownDevice_ = nullptr;
+    lastKnownDDraw_ = nullptr;
+    g_renderThreadId.store(0, std::memory_order_release);
     deviceGeneration_.fetch_add(1, std::memory_order_release);
     SetServiceRunning(false);
     return true;
@@ -417,7 +435,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
                  prevThreadId, threadId);
         g_renderThreadId.store(threadId, std::memory_order_release);
     }
-    if (!imguiInitialized_ || deviceLost_) {
+    if (!imguiInitialized_) {
         return;
     }
 
@@ -435,16 +453,46 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
     auto* dd = d3dx->GetDD();
     if (dd) {
         HRESULT hr = dd->TestCooperativeLevel();
-        if (FAILED(hr)) {
+        if (IsDeviceLostResult_(hr)) {
             if (!deviceLost_) {
                 OnDeviceLost_();
             }
             return;
-        } else if (deviceLost_) {
-            OnDeviceRestored_();
         }
     } else {
         return;
+    }
+
+    const bool interfacesChanged = lastKnownDevice_ != device || lastKnownDDraw_ != dd;
+    const bool hadKnownInterfaces = lastKnownDevice_ != nullptr || lastKnownDDraw_ != nullptr;
+    if (interfacesChanged) {
+        if (hadKnownInterfaces) {
+            LOG_WARN("ImGuiService::RenderFrame_: DX7 interfaces changed (device {} -> {}, dd {} -> {})",
+                     static_cast<void*>(lastKnownDevice_),
+                     static_cast<void*>(device),
+                     static_cast<void*>(lastKnownDDraw_),
+                     static_cast<void*>(dd));
+            if (!deviceLost_) {
+                OnDeviceLost_();
+            }
+        }
+
+        lastKnownDevice_ = device;
+        lastKnownDDraw_ = dd;
+
+        if (!ImGui_ImplDX7_UpdateDevice(device, dd)) {
+            LOG_ERROR("ImGuiService::RenderFrame_: failed to update ImGui DX7 backend interfaces");
+            return;
+        }
+
+        DX7InterfaceHook::InstallSceneHooks();
+    }
+
+    if (deviceLost_) {
+        d3dx->RestoreSurfaces();
+        if (!OnDeviceRestored_()) {
+            return;
+        }
     }
 
     if (!ImGui::GetCurrentContext()) {
@@ -529,6 +577,15 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
     ImGui::EndFrame();
     ImGui::Render();
+
+    const HRESULT preRenderHr = dd->TestCooperativeLevel();
+    if (IsDeviceLostResult_(preRenderHr)) {
+        if (!deviceLost_) {
+            OnDeviceLost_();
+        }
+        return;
+    }
+
     ImGui_ImplDX7_RenderDrawData(ImGui::GetDrawData());
 
     if (!loggedFirstRender) {
@@ -1275,13 +1332,15 @@ void ImGuiService::OnDeviceLost_() {
     LOG_WARN("ImGuiService::OnDeviceLost_: device lost, notified panels and invalidated textures");
 }
 
-void ImGuiService::OnDeviceRestored_() {
-    deviceLost_ = false;
+bool ImGuiService::OnDeviceRestored_() {
+    if (!ImGui_ImplDX7_CreateDeviceObjects()) {
+        LOG_WARN("ImGuiService::OnDeviceRestored_: failed to recreate backend device objects");
+        return false;
+    }
 
     // Increment device generation to invalidate old handles
     uint32_t newGen = deviceGeneration_.fetch_add(1, std::memory_order_release) + 1;
-
-    ImGui_ImplDX7_CreateDeviceObjects();
+    deviceLost_ = false;
 
     std::vector<ImGuiPanelDesc> panelsToNotify;
     {
@@ -1299,6 +1358,7 @@ void ImGuiService::OnDeviceRestored_() {
     }
 
     LOG_INFO("ImGuiService::OnDeviceRestored_: device restored (new gen={}) and notified panels", newGen);
+    return true;
 }
 
 void ImGuiService::InvalidateAllTextures_() {

@@ -1,6 +1,7 @@
 #include "DX7InterfaceHook.h"
 
 #include <atomic>
+#include <d3d.h>
 #include <filesystem>
 #include <Windows.h>
 
@@ -230,6 +231,21 @@ bool DX7InterfaceHook::InstallSceneHooks()
         return true;
     }
 
+    if (hookedDevice && origEndScene && hookedDevice != device) {
+        void** oldVtable = *reinterpret_cast<void***>(hookedDevice);
+        if (oldVtable) {
+            DWORD oldProtect = 0;
+            if (VirtualProtect(&oldVtable[kEndSceneVTableIndex], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                InterlockedExchange(reinterpret_cast<LONG*>(&oldVtable[kEndSceneVTableIndex]),
+                                   reinterpret_cast<LONG>(origEndScene));
+                VirtualProtect(&oldVtable[kEndSceneVTableIndex], sizeof(void*), oldProtect, &oldProtect);
+            }
+        }
+        hookedDevice->Release();
+        s_HookedDevice.store(nullptr, std::memory_order_release);
+        s_OriginalEndScene.store(nullptr, std::memory_order_release);
+    }
+
     auto* originalFunc = reinterpret_cast<HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice7*)>(
         vtable[kEndSceneVTableIndex]);
     if (!originalFunc) {
@@ -251,6 +267,7 @@ bool DX7InterfaceHook::InstallSceneHooks()
     InterlockedExchange(reinterpret_cast<LONG*>(&vtable[kEndSceneVTableIndex]),
                        reinterpret_cast<LONG>(hookFunc));
 
+    device->AddRef();
     // Store hooked device atomically
     s_HookedDevice.store(device, std::memory_order_release);
 
@@ -285,6 +302,7 @@ void DX7InterfaceHook::ShutdownImGui()
                 VirtualProtect(&vtable[kEndSceneVTableIndex], sizeof(void*), oldProtect, &oldProtect);
             }
         }
+        hookedDevice->Release();
     }
     if (ImGui::GetCurrentContext()) {
         ImGui_ImplDX7_Shutdown();

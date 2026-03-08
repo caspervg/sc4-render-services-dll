@@ -144,7 +144,7 @@ private:
     bool RebuildFontAtlas_();
     bool CreateSurfaceForTexture_(ManagedTexture& tex);
     void OnDeviceLost_();
-    void OnDeviceRestored_();
+    bool OnDeviceRestored_();
     void InvalidateAllTextures_();
 
 private:
@@ -166,6 +166,8 @@ private:
     ImGuiInitSettings initSettings_;
     HWND gameWindow_;
     WNDPROC originalWndProc_;
+    IDirect3DDevice7* lastKnownDevice_;
+    IDirectDraw7* lastKnownDDraw_;
     std::atomic<bool> initialized_;
     std::atomic<bool> imguiInitialized_;
     bool hookInstalled_;
